@@ -184,3 +184,4 @@ def test_resnet(model, dataloader, criterion, device, args):
     rec = recall_score(truths, round_preds, average="macro")
     avg_loss = total_loss / len(dataloader)
     return avg_loss, acc, f1, prec, rec
+

@@ -16,9 +16,10 @@ from torch.utils.tensorboard import SummaryWriter
 import time
 from resnet_models import ResNetModel
 from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
+import time
 
 """
-python code/train_resnet.py -gd data/girus -vd data/virus -uc -cd embeddings/cont/ -up -pd embeddings/pos -us -sd embeddings/seq -ua -ad embeddings/aa -o results/ -ur  -g -b 10 -e 1 -sc 6
+python code/train_resnet.py -gd data/girus/300 -vd data/virus/300 -td data/GVMAG/300 -uc -cd embeddings/cont/ -up -pd embeddings/pos -us -sd embeddings/seq -ua -ad embeddings/aa -o results/ -ur  -g -b 10 -e 1 -sc -uk -l0 3 -l1 4 -l2 6 -l3 3 -bt basic 6
 
 """
 
@@ -26,7 +27,7 @@ python code/train_resnet.py -gd data/girus -vd data/virus -uc -cd embeddings/con
 
 def main(args):
     # Load data
-    layers = [3, 4, 6, 3]
+    layers = [args.layer0, args.layer1, args.layer2, args.layer3]
     random.seed(17)
     torch.manual_seed(17)  # Randomly seed PyTorch
     device = torch.device("cuda:0" if (torch.cuda.is_available() and args.use_gpu) else "cpu")
@@ -72,6 +73,7 @@ def main(args):
         # Create model, train, and test k-fold times
         loss_writer = SummaryWriter(f"{args.output_dir}/runs")
         model = ResNetModel(layers,
+                            args.block_type,
                             all_embs,
                             num_kmers_per_read,
                             num_channels,
@@ -81,7 +83,7 @@ def main(args):
                             vec_sizes=vec_sizes,
                             ).to(device)
         model.apply(utils.init_weights)
-        opt = optim.Adam(model.parameters(), args.learning_rate, weight_decay=args.weight_decay)
+        opt = optim.Adam(model.parameters(), args.learning_rate)
         # TODO test other loss functions
         criterion = nn.BCELoss()
 
@@ -90,6 +92,7 @@ def main(args):
             model.train()
             total_loss = 0.0
             running_loss = 0.0
+            print(f"len train_dataloader = {len(train_dataloader)}")
             for batch_count, (data, labels) in enumerate(train_dataloader):
                 # Clear the model gradients and current gradient
                 data, labels = data.to(device), labels.float().to(device)
@@ -146,15 +149,14 @@ def main(args):
     #Test against GVMAGs
     print("Testing GVMAGs")
     test_file = f"{args.output_dir}/GVMAG_r{args.read_size}_k{args.kmer_sizes}.csv"
-    model.load_state_dict(torch.load(best_model_path), map_location=device)
     with open(test_file, "w") as out:
-        out.write("SC,Test Loss,Accuracy,F1-Score,Precision,Recall\n")
+        out.write("SC,Epoch,Test Loss,Accuracy,F1-Score,Precision,Recall\n")
         losses, accs, f1s, precs, recs = [], [], [], [], []
         for superclade in range(1, 11):
             if superclade == 5:
                 continue
             print(f"superclade {superclade}")
-            tmp_in_dir = f"{args.input_dir}/SC{superclade}"
+            tmp_in_dir = f"{args.test_dir}/SC{superclade}"
             # Load data
             test_reads, test_labels, kmer_dict, num_kmers_per_read = utils.read_fastas_from_dirs_CNN(
                 [tmp_in_dir],
@@ -167,18 +169,19 @@ def main(args):
             test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=True,
                                                               num_workers=0,
                                                               drop_last=False)
-            model.eval()
-            avg_test_loss, acc, f1, prec, rec = utils.test_resnet(model, test_dataloader, criterion, device, args)
-            out.write(f"{superclade},{avg_test_loss:.4f},{acc:.4f},{f1:.4f},{prec:.4f},{rec:.4f}\n")
-            losses.append(avg_test_loss)
-            accs.append(acc)
-            f1s.append(f1)
-            precs.append(prec)
-            rec.append(rec)
-        out.write(f"-1,-1,{np.average(losses):.4f},{np.average(accs):.4f},{np.average(f1s):.4f},"
-                  f"{np.average(precs):.4f},{np.average(recs):.4f}\n")
-        out.write(f"-2,-2,{np.std(losses):.4f},{np.std(accs):.4f},{np.std(f1s):.4f},{np.std(precs):.4f},"
-                  f"{np.std(recs):.4f}\n")
+            for tmp_epoch in range(args.epochs):
+                curr_model_path = f"{model_dir}/model_r{args.read_size}_k{args.kmer_sizes}" \
+                          f"_layers{layers}_epoch{tmp_epoch}.pt"
+                model.load_state_dict(torch.load(curr_model_path, map_location=device))
+
+                model.eval()
+                avg_test_loss, acc, f1, prec, rec = utils.test_resnet(model, test_dataloader, criterion, device, args)
+                out.write(f"{superclade},{tmp_epoch},{avg_test_loss:.4f},{acc:.4f},{f1:.4f},{prec:.4f},{rec:.4f}\n")
+                losses.append(avg_test_loss)
+                accs.append(acc)
+                f1s.append(f1)
+                precs.append(prec)
+                recs.append(rec)
 
 
 def get_args():
@@ -253,16 +256,16 @@ def get_args():
                         help="indicate whether to freeze embeddings or make them trainable")
     parser.set_defaults(freeze=True)
 
-    parser.add_argument("-p", "--padding", type=int,
-                        help="amount of padding to use for convolution layers",
-                        default=0)
-
-    parser.add_argument("-do", "--dropout", type=float,
-                        help="dropout rate for linear layers",
-                        default=0.0)
-    parser.add_argument("-wd", "--weight_decay", type=float,
-                        help="weight_decay for L2 regularization",
-                        default=0.0)
+    parser.add_argument("-l0", "--layer0", type=int, required=True,
+                        help="number of blocks in layer 0")
+    parser.add_argument("-l1", "--layer1", type=int, required=True,
+                        help="number of blocks in layer 1")
+    parser.add_argument("-l2", "--layer2", type=int, required=True,
+                        help="number of blocks in layer 2")
+    parser.add_argument("-l3", "--layer3", type=int, required=True,
+                        help="number of blocks in layer 3")
+    parser.add_argument("-bt", "--block_type", required=True,
+                        help="type of block to use for resnet (basic or bottleneck)")
     parser.add_argument('kmer_sizes', metavar='kmer_sizes', type=int, nargs='+',
                         help='kmer sizes to use')
 

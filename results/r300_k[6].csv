@@ -1,2 +1,1 @@
-Epoch,Test Loss,Accuracy,F1-Score,Precision,Recall
-0,0,1.8440,0.3947,0.2850,0.6969,0.5012
+Epoch,Dev Loss,Accuracy,F1-Score,Precision,Recall

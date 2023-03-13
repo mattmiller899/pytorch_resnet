@@ -7,6 +7,13 @@ import resnet_utils as utils
 from functools import partial
 
 
+def conv1x1(in_channels, out_channels, stride=1):
+    return nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False)
+
+
+def conv3x3(in_channels, out_channels, stride=1, padding=1):
+    return nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, bias=False, padding=padding)
+
 class ReshapeTensor(nn.Module):
     def __init__(self, read_size, latent_size, model_type="gen"):
         super().__init__()
@@ -42,16 +49,17 @@ def activation_func(activation):
     ])[activation]
 
 
-class ResBlock(nn.Module):
+class ResBasicBlock(nn.Module):
+    expansion = 1
     def __init__(self, in_channels, out_channels, stride=1, downsample=None, debug=False):
-        super(ResBlock, self).__init__()
+        super(ResBasicBlock, self).__init__()
         self.debug = debug
         self.conv1 = nn.Sequential(
-                        nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1),
+                        conv3x3(in_channels, out_channels, stride=stride, padding=1),
                         nn.BatchNorm2d(out_channels),
                         nn.ReLU())
         self.conv2 = nn.Sequential(
-                        nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1),
+                        conv3x3(out_channels, out_channels, stride=1, padding=1),
                         nn.BatchNorm2d(out_channels))
         self.downsample = downsample
         self.relu = nn.ReLU()
@@ -76,17 +84,57 @@ class ResBlock(nn.Module):
         return out
 
 
+class ResBottleneckBlock(nn.Module):
+    expansion = 4
+    def __init__(self, in_channels, out_channels, stride=1, downsample=None, debug=False, base_width=64):
+        super(ResBottleneckBlock, self).__init__()
+        self.debug = debug
+        self.conv1 = nn.Sequential(
+                        conv1x1(in_channels, out_channels),
+                        nn.BatchNorm2d(out_channels),
+                        nn.ReLU())
+        self.conv2 = nn.Sequential(
+                        conv3x3(out_channels, out_channels, stride=stride, padding=1),
+                        nn.BatchNorm2d(out_channels),
+                        nn.ReLU())
+        self.conv3 = nn.Sequential(
+                        conv1x1(out_channels, out_channels * self.expansion),
+                        nn.BatchNorm2d(out_channels * self.expansion))
+        self.downsample = downsample
+        self.relu = nn.ReLU()
+        self.out_channels = out_channels
+
+    def forward(self, x):
+        residual = x
+        if self.debug:
+            print(f"resblock x.size = {x.size()}")
+        out = self.conv1(x)
+        if self.debug:
+            print(f"resblock conv1 out.size = {out.size()}")
+        out = self.conv2(out)
+        if self.debug:
+            print(f"resblock conv2 out.size = {out.size()}")
+        out = self.conv3(out)
+        if self.debug:
+            print(f"resblock conv3 out.size = {out.size()}")
+        if self.downsample:
+            residual = self.downsample(x)
+        if self.debug:
+            print(f"resblock residual.size = {residual.size()}")
+        out += residual
+        out = self.relu(out)
+        return out
+
 class ResNetModel(nn.Module):
     """
     The overall ResNet model
     """
-    def __init__(self, layers, vecs, num_kmers, in_channels, use_gpu=True, freeze=True, debug=False, activation="relu", block=ResBlock, kmer_sizes=None, vec_sizes=None, out_channels=64,
+    def __init__(self, layers, block_type, vecs, num_kmers, in_channels, use_gpu=True, freeze=True, debug=False, activation="relu", kmer_sizes=None, vec_sizes=None, out_channels=64,
                  *args, **kwargs):
         super(ResNetModel, self).__init__()
         self.DEVICE = torch.device("cuda" if use_gpu else "cpu")
         self.IN_CHANNELS = in_channels
         self.OUT_CHANNELS = out_channels
-        self.conv5x5 = partial(Conv1dAutoPad, kernel_size=5, bias=True)
         self.debug = debug
         self.NUM_KMERS = num_kmers
         self.LAYERS = layers
@@ -96,7 +144,13 @@ class ResNetModel(nn.Module):
         self.VOCAB_SIZE = 0
         for k in kmer_sizes:
             self.VOCAB_SIZE += 4 ** k
-
+        if block_type == "basic":
+            block = ResBasicBlock
+        elif block_type == "bottleneck":
+            block = ResBottleneckBlock
+        else:
+            print(f"ERROR: invalid type of block {block_type}")
+            exit()
         self.embeddings = nn.ModuleList()
         if in_channels == 1:
             self.embeddings.append(nn.Embedding.from_pretrained(vecs, freeze=freeze))
@@ -123,13 +177,18 @@ class ResNetModel(nn.Module):
 
 
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.l0 = self.ResNetLayer(block, self.OUT_CHANNELS, self.LAYERS[0], stride=1)
-        self.l1 = self.ResNetLayer(block, self.OUT_CHANNELS*2, self.LAYERS[1], stride=2)
-        self.l2 = self.ResNetLayer(block, self.OUT_CHANNELS*2, self.LAYERS[2], stride=2)
-        self.l3 = self.ResNetLayer(block, self.OUT_CHANNELS*2, self.LAYERS[3], stride=2)
+        self.l0 = self.ResNetLayer(block, 64, self.LAYERS[0], stride=1)
+        print(self.l0)
+        self.l1 = self.ResNetLayer(block, 128, self.LAYERS[1], stride=2)
+        print(self.l1)
+        self.l2 = self.ResNetLayer(block, 256, self.LAYERS[2], stride=2)
+        print(self.l2)
+        self.l3 = self.ResNetLayer(block, 512, self.LAYERS[3], stride=2)
+        print(self.l3)
+        exit()
         self.avgpool = nn.AvgPool2d(3, stride=1)
         # TODO figure out how to get this value from input dimensions/model architecture
-        self.fc = nn.Linear(17408, 1)
+        self.fc = nn.Linear(17408 * block.expansion, 1)
 
 
     def ResNetLayer(self, block, planes, blocks, stride=1):
@@ -137,14 +196,14 @@ class ResNetModel(nn.Module):
         A ResNet layer composed by `blocks` blocks stacked one after the other
         """
         downsample = None
-        if stride != 1 or self.OUT_CHANNELS != planes:
+        if stride != 1 or self.OUT_CHANNELS != planes * block.expansion:
             downsample = nn.Sequential(
-                nn.Conv2d(self.OUT_CHANNELS, planes, kernel_size=1, stride=stride),
-                nn.BatchNorm2d(planes),
+                nn.Conv2d(self.OUT_CHANNELS, planes * block.expansion, kernel_size=1, stride=stride),
+                nn.BatchNorm2d(planes * block.expansion),
             )
         layers = []
         layers.append(block(self.OUT_CHANNELS, planes, stride, downsample, debug=self.debug))
-        self.OUT_CHANNELS = planes
+        self.OUT_CHANNELS = planes * block.expansion
         for i in range(1, blocks):
             layers.append(block(self.OUT_CHANNELS, planes, debug=self.debug))
         return nn.Sequential(*layers)
@@ -193,43 +252,6 @@ class ResNetModel(nn.Module):
             print(f"flat x.size = {x.size()}")
         x = self.fc(x)
         if self.debug:
-            print(f"fc x.size = {x.size()}")
+            print(f"fc x.size = {x.size()}\nfc x = {x}")
         output = torch.sigmoid(x)
         return output
-
-
-
-"""
-class GAN_Generator(nn.Module):
-    def __init__(self, use_gpu, debug=False, in_channels=100, activation="relu", block=ResNetBasicBlock,
-                 latent_size=100, read_size=100, n=5, *args, **kwargs):
-        super(GAN_Generator, self).__init__()
-        self.DEVICE = torch.device("cuda" if use_gpu else "cpu")
-        self.LATENT_SIZE = latent_size
-        self.READ_SIZE = read_size
-        self.IN_CHANNELS = in_channels
-        self.conv5x5 = partial(Conv1dAutoPad, kernel_size=5, bias=True)
-        self.debug = debug
-
-        self.blocks = nn.ModuleList([
-            nn.Linear(self.LATENT_SIZE, self.READ_SIZE*self.LATENT_SIZE), # input: (batch_size, latent_size) output: (batch_size, read_size*latent_size)
-            ReshapeTensor(read_size=self.READ_SIZE, latent_size=self.LATENT_SIZE, model_type="gen"),  # (batch_size, latent_size, read_size)
-            ResNetLayer(self.LATENT_SIZE, self.LATENT_SIZE, n=n, activation=activation, block=block, conv=self.conv5x5,
-                        *args, **kwargs),  # (batch_size, latent_size, read_size) TODO switch read and latent potentially
-            nn.Conv1d(in_channels=self.LATENT_SIZE, out_channels=4, kernel_size=1, bias=True),  # (batch_size, 4, read_size)
-            nn.Softmax(dim=1)  # (batch_size, 4, read_size)
-        ])
-
-
-    def forward(self, data):
-        x = data # (batch_size, latent_size)
-        if self.debug:
-            print(f"x_og shape = {x.size()}")
-        for i, tmp_block in enumerate(self.blocks):
-            x = tmp_block(x)
-            if self.debug:
-                print(f"x{i} shape = {x.size()}")
-        if self.debug:
-            print(f"final x = {x[0]}\n")
-        return x
-"""
